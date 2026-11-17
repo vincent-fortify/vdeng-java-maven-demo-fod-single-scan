@@ -1,0 +1,99 @@
+# Fortify on Demand SAST scan using a Single Scan entitlement (1 AU per scan)
+# Save in the repo as .github/workflows/fortify.yml
+#
+# Why the extra setup step: fortify/github-action@v3 uses fcli's setup-release action,
+# which always configures --frequency=Subscription. This workflow configures the
+# release with the Single Scan entitlement first, then runs the action with DO_SETUP=false.
+#
+# Aviator: enabled in the release's static scan settings (--use-aviator), so every scan is audited by Aviator.
+# GitHub SARIF: the action exports SAST results and publishes them to GitHub code scanning
+# (Security tab) using the workflow's GITHUB_TOKEN; needs security-events: write and code scanning enabled.
+#
+# Required repository secrets: FOD_TENANT, FOD_USER, FOD_PAT
+
+name: Fortify Security Scan
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fortify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Fortify-SAST:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      pull-requests: write
+    env:
+      FOD_URL: https://ams.fortify.com            # confirm the tenant's data centre
+      FOD_TENANT: ${{ secrets.FOD_TENANT }}
+      FOD_USER: ${{ secrets.FOD_USER }}
+      FOD_PASSWORD: ${{ secrets.FOD_PAT }}
+      # Same as the action's default naming: <org>/<repo>:<branch>
+      FOD_RELEASE: ${{ github.repository }}:${{ github.head_ref || github.ref_name }}
+      FOD_ENTITLEMENT_ID: '13738'                  # Single Scan (1 Unit)
+      FCLI_BOOTSTRAP_VERSION: v3.28
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'                       # builds the project's Java 8 source/target
+
+      - name: Install fcli
+        uses: fortify/github-action/setup@v3
+        with:
+          fcli: bootstrapped
+
+      - name: Configure FoD release (Single Scan, 1 AU)
+        run: |
+          set -euo pipefail
+          fcli fod session login --url "$FOD_URL" --tenant "$FOD_TENANT" \
+            --user "$FOD_USER" --password "$FOD_PASSWORD" --fod-session setup
+
+          # Create the application and release if missing (no --scan-types, so no SAST settings applied).
+          # PR releases copy state from the main release, so audit decisions and suppressions carry over (SC7).
+          COPY_OPTS=()
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            COPY_OPTS=(--copy-from "${GITHUB_REPOSITORY}:${GITHUB_BASE_REF}")
+          fi
+          fcli fod action run setup-release --fod-session setup --release "$FOD_RELEASE" "${COPY_OPTS[@]}"
+
+          # Configure static scan settings on the Single Scan entitlement
+          # Add --skip-if-exists to leave already-configured releases untouched
+          fcli fod sast-scan setup --fod-session setup --rel "$FOD_RELEASE" \
+            --assessment-type "Static Assessment" \
+            --entitlement-id "$FOD_ENTITLEMENT_ID" --frequency SingleScan \
+            --audit-preference Automated --use-aviator
+
+          fcli fod session logout --fod-session setup
+
+      - name: Run Fortify on Demand SAST scan
+        uses: fortify/github-action@v3
+        env:
+          DO_SETUP: false                          # settings applied in the previous step
+          DO_AVIATOR_AUDIT: true                   # Aviator is set on the release above; keeps the action's Aviator-dependent steps enabled
+          # Packaging is per repo (SC3/SC4/SC8). No compile step; Maven/Gradle only resolve dependencies.
+          #   Maven:            -bt mvn -bf pom.xml
+          #   Gradle:           -bt gradle
+          #   No build tool (JS/TS, Python, IaC, scripts): -bt none
+          PACKAGE_EXTRA_OPTS: "-bt mvn -bf pom.xml"
+          DO_CHECK_POLICY: true
+          DO_PR_COMMENT: ${{ github.event_name == 'pull_request' }}   # preview feature
+          DO_SAST_EXPORT: true                     # export SAST results to GitHub code scanning (default on, set explicitly)
+          SAST_EXPORT_EXTRA_OPTS: "--type sarif"   # SARIF only; fail instead of falling back to a Check Run if code scanning is unavailable
