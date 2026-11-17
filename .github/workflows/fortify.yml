@@ -37,7 +37,7 @@ jobs:
       security-events: write
       pull-requests: write
     env:
-      FOD_URL: https://apac.fortify.com            # confirm the tenant's data centre
+      FOD_URL: https://ams.fortify.com            # confirm the tenant's data centre
       FOD_TENANT: ${{ secrets.FOD_TENANT }}
       FOD_USER: ${{ secrets.FOD_USER }}
       FOD_PASSWORD: ${{ secrets.FOD_PAT }}
